@@ -1,0 +1,299 @@
+<#
+.SYNOPSIS
+  Comprobación "sensata" de actualizabilidad a Windows 11 (PS 5.1 compatible, ES-friendly).
+
+.DESCRIPTION
+  Evalúa CPU (64-bit, núcleos, SSE4.1/4.2 heurístico), RAM, TPM (1.2/2.0),
+  Modo BIOS/UEFI, Secure Boot (capaz/habilitado usando CIM/Registro/BCD/cmdlet),
+  tipo de disco del SO (SSD si detectable). Devuelve puntuación y veredicto.
+  -StrictSecurity exige Secure Boot habilitado.
+
+.NOTES
+  Ejecutar en PowerShell x64 (no x86) y preferiblemente elevado.
+#>
+
+param([switch]$StrictSecurity)
+
+# --- Utilidades ---
+function Convert-BytesToGB([UInt64]$bytes) { [Math]::Round($bytes / 1GB, 2) }
+
+function Test-IsWow64 {
+  if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) { return $true }
+  return $false
+}
+
+function Test-IsAdmin {
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $pr = New-Object Security.Principal.WindowsPrincipal($id)
+    return $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch { return $false }
+}
+
+function Get-FirmwareMode {
+  # 1) Registro PEFirmwareType (1=BIOS, 2=UEFI)
+  try {
+    $pe = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name PEFirmwareType -ErrorAction Stop
+    if ($pe.PEFirmwareType -eq 2) { return "UEFI" }
+    if ($pe.PEFirmwareType -eq 1) { return "BIOS (Legacy)" }
+  } catch { }
+
+  # 2) Existencia de la clave de SecureBoot (si existe, sabemos que estamos en UEFI)
+  try {
+    if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State') { return "UEFI" }
+  } catch { }
+
+  # 3) bcdedit: línea localizada "path"/"ruta" + winload.efi/.exe
+  try {
+    $bcd = bcdedit /enum {current} 2>$null
+    if ($LASTEXITCODE -eq 0 -and $bcd) {
+      foreach ($ln in $bcd) {
+        if ($ln -imatch '(path|ruta)\s+.*winload\.efi') { return "UEFI" }
+        if ($ln -imatch '(path|ruta)\s+.*winload\.exe') { return "BIOS (Legacy)" }
+      }
+    }
+  } catch { }
+
+  return "Desconocido"
+}
+
+function Get-SecureBootAssessment {
+  # Devuelve Mode, State (Enabled/Disabled/Unsupported/Unknown), Supported (bool) y Details
+  $mode = Get-FirmwareMode
+  $state = "Unknown"
+  $supported = $false
+  $details = @{}
+
+  if ($mode -ne "UEFI") {
+    return [PSCustomObject]@{ Mode=$mode; State="Unsupported"; Supported=$false; Details=$details }
+  }
+
+  # 0) Señal: ¿existe la clave de estado?
+  $secureBootKeyExists = $false
+  try {
+    $secureBootKeyExists = Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State'
+  } catch { }
+  if ($secureBootKeyExists) {
+    $supported = $true
+    $details.KeyExists = $true
+  }
+
+  # 1) CIM root\wmi:MS_SecureBoot (preferente)
+  try {
+    $sb = Get-CimInstance -Namespace root\wmi -ClassName MS_SecureBoot -ErrorAction Stop
+    if ($sb -ne $null) {
+      $supported = [bool]$sb.SecureBootCapable
+      if ($supported) {
+        if ($sb.SecureBootEnabled) { $state = "Enabled" } else { $state = "Disabled" }
+      } else {
+        $state = "Unsupported"
+      }
+      $details.CIM = $sb
+    }
+  } catch { }
+
+  # 2) Registro (intento de lectura de valores, si la clave existe)
+  if ($state -eq "Unknown" -and $secureBootKeyExists) {
+    try {
+      $k = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -ErrorAction Stop
+      $enabledVal = $null
+      if ($k.PSObject.Properties.Name -contains 'SecureBoot') {
+        $enabledVal = [int]$k.SecureBoot
+      } elseif ($k.PSObject.Properties.Name -contains 'UEFISecureBootEnabled') {
+        $enabledVal = [int]$k.UEFISecureBootEnabled
+      }
+      if ($enabledVal -ne $null) {
+        if ($enabledVal -eq 1) { $state = "Enabled" } else { $state = "Disabled" }
+      } else {
+        $state = "Unknown"
+      }
+      $details.Registry = $k
+    } catch {
+      # no pasa nada, ya marcamos Supported por existencia de clave
+    }
+  }
+
+  # 3) bcdedit: si llegamos aquí y seguimos Unknown, dejamos Supported tal cual (true si la clave existía)
+  if ($state -eq "Unknown" -and -not $details.ContainsKey("BCD")) {
+    $details.BCD = "UEFI detectado (Get-FirmwareMode). Estado exacto no legible."
+    if (-not $supported) { $supported = $true }
+  }
+
+  # 4) Último recurso: cmdlet (requiere x64/elevado en muchos equipos)
+  if ($state -eq "Unknown") {
+    try {
+      $isOn = Confirm-SecureBootUEFI -ErrorAction Stop
+      $supported = $true
+      if ($isOn) { $state = "Enabled" } else { $state = "Disabled" }
+      $details.Cmdlet = $true
+    } catch { }
+  }
+
+  [PSCustomObject]@{
+    Mode=$mode; State=$state; Supported=$supported; Details=$details
+  }
+}
+
+function Get-TPMInfo {
+  $res = [ordered]@{ Present=$null; Ready=$null; SpecVersion=$null; Manufacturer=$null; Error=$null }
+  try {
+    $tpm = Get-TPM -ErrorAction Stop
+    $res.Present = $tpm.TpmPresent
+    $res.Ready   = $tpm.TpmReady
+    if ($tpm.SpecVersion) { $res.SpecVersion = ($tpm.SpecVersion -split ',')[0].Trim() }
+    try {
+      $wmi = Get-CimInstance -Namespace root\cimv2\security\microsofttpm -ClassName Win32_Tpm -ErrorAction Stop
+      $res.Manufacturer = $wmi.ManufacturerIdTxt
+      if (-not $res.SpecVersion -and $wmi.SpecVersion) {
+        $res.SpecVersion = ($wmi.SpecVersion | Select-Object -First 1)
+      }
+    } catch { }
+  } catch { $res.Error = $_.Exception.Message }
+  return $res
+}
+
+function Guess-SSEFromCpuName($cpuName) {
+  if ($cpuName -match "Intel\(R\) Core\(TM\)" -or $cpuName -match "AMD Ryzen" -or $cpuName -match "Xeon") { return $true }
+  return $null
+}
+
+function Get-SystemDiskInfo {
+  $res = [ordered]@{ MediaType="Unknown"; Model=$null; FriendlyName=$null; BusType=$null; Error=$null }
+  try {
+    $sysLetter = ($env:SystemDrive)[0]
+    $part = Get-Partition -DriveLetter $sysLetter -ErrorAction Stop
+    $disk = Get-Disk -Number $part.DiskNumber -ErrorAction Stop
+    if ($disk -ne $null) {
+      if ($disk.MediaType) { $res.MediaType = $disk.MediaType.ToString() } else { $res.MediaType = "Unknown" }
+      $res.FriendlyName = $disk.FriendlyName
+      $res.BusType      = $disk.BusType
+      if ([string]::IsNullOrWhiteSpace($res.Model)) { $res.Model = $disk.FriendlyName }
+      return $res
+    }
+  } catch { }
+  try {
+    $disk = Get-CimInstance Win32_DiskDrive | Sort-Object -Property Index | Select-Object -First 1
+    if ($disk -ne $null) {
+      $res.Model = $disk.Model
+      if ($disk.Model -match "SSD") { $res.MediaType = "SSD (heurístico)" }
+    }
+  } catch { $res.Error = $_.Exception.Message }
+  return $res
+}
+
+# --- Avisos de entorno ---
+if (Test-IsWow64) { Write-Warning "Estás en PowerShell x86 (WOW64). Usa PowerShell x64 para detecciones fiables." }
+if (-not (Test-IsAdmin)) { Write-Warning "No estás en consola elevada. Algunas lecturas (Secure Boot) pueden quedar 'Unknown'." }
+
+# --- Recopilación ---
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$cs  = Get-CimInstance Win32_ComputerSystem
+$os  = Get-CimInstance Win32_OperatingSystem
+
+$cpuName = $cpu.Name.Trim()
+$cores   = $cpu.NumberOfCores
+$threads = $cpu.NumberOfLogicalProcessors
+$arch64  = ($cpu.AddressWidth -eq 64)
+$ramGB   = Convert-BytesToGB $cs.TotalPhysicalMemory
+
+$sseSupport = Guess-SSEFromCpuName $cpuName
+$sb       = Get-SecureBootAssessment
+$biosMode = $sb.Mode
+$sbState  = $sb.State
+
+$tpm      = Get-TPMInfo
+$diskInfo = Get-SystemDiskInfo
+
+# --- Reglas ---
+$reasons = New-Object System.Collections.Generic.List[string]
+$ok64   = $arch64
+if (-not $ok64) { $reasons.Add("CPU de 32-bit.") }
+
+$okCores = ($cores -ge 2)
+if (-not $okCores) { $reasons.Add("Menos de 2 núcleos físicos.") }
+
+$okRAM  = ($ramGB -ge 8)
+if (-not $okRAM) { $reasons.Add("RAM < 8 GB.") }
+
+$okSSE  = ($sseSupport -eq $true)
+if (-not $okSSE) { $reasons.Add("SSE4.1/4.2 no detectado o desconocido (heurístico).") }
+
+$uefiOk = ($biosMode -eq "UEFI")
+if (-not $uefiOk) { $reasons.Add("Arranque en BIOS Legacy (no UEFI).") }
+
+$secureBootSupported = ($sb.Supported -eq $true)
+$secureBootEnabled   = ($sbState -eq "Enabled")
+
+if (-not $secureBootSupported) {
+  $reasons.Add("Secure Boot no soportado/capaz.")
+} else {
+  if (-not $secureBootEnabled) { $reasons.Add("Secure Boot disponible pero desactivado (o no legible).") }
+}
+
+$tpmOk = ($tpm.Present -eq $true)
+if (-not $tpmOk) { $reasons.Add("TPM ausente/deshabilitado.") }
+
+$ssdHas = $false
+if ($diskInfo.MediaType -match "SSD") { $ssdHas = $true }
+
+# --- Puntuación ---
+$score = 0
+if ($ok64)                 { $score += 2 }
+if ($okCores)              { $score += 1 }
+if ($okRAM)                { $score += 2 }
+if ($okSSE)                { $score += 3 }
+if ($uefiOk)               { $score += 1 }
+if ($secureBootEnabled)    { $score += 1 }
+if ($tpmOk)                { $score += 2 }
+if ($ssdHas)               { $score += 1 }
+
+# --- Veredicto ---
+$veredicto = "Actualizable con reservas"
+
+if ($StrictSecurity) {
+  if ($ok64 -and $okCores -and $okRAM -and $okSSE -and $uefiOk -and $tpmOk -and $secureBootEnabled) {
+    $veredicto = "Actualizable (sensata)"
+  } elseif (-not $okSSE -or -not $uefiOk -or -not $secureBootEnabled) {
+    $veredicto = "No recomendable"
+  }
+} else {
+  if ($ok64 -and $okCores -and $okRAM -and $okSSE -and $uefiOk -and $tpmOk -and $secureBootSupported) {
+    if ($secureBootEnabled) { $veredicto = "Actualizable (sensata)" } else { $veredicto = "Actualizable con reservas" }
+  }
+  if (-not $okSSE -or -not $uefiOk -or -not $secureBootSupported) {
+    $veredicto = "No recomendable"
+  }
+}
+
+# --- Salida ---
+$info = [PSCustomObject]@{
+  Equipo               = $env:COMPUTERNAME
+  SO                   = "$($os.Caption) $($os.Version)"
+  CPU_Nombre           = $cpuName
+  CPU_64bit            = $arch64
+  CPU_Nucleos          = $cores
+  CPU_Hilos            = $threads
+  SSE41_42             = if ($okSSE) { "Sí (heurístico)" } else { "No/Desconocido" }
+  RAM_GB               = $ramGB
+  BIOS_Modo            = $biosMode
+  SecureBoot_Estado    = $sbState
+  SecureBoot_Soportado = $secureBootSupported
+  TPM_Presente         = $tpm.Present
+  TPM_Version          = $tpm.SpecVersion
+  TPM_Fabricante       = $tpm.Manufacturer
+  Disco_SO_MediaType   = $diskInfo.MediaType
+  Veredicto            = $veredicto
+  Puntuacion_Sensata   = $score
+}
+
+$info | Format-List
+
+if ($reasons.Count -gt 0) {
+  Write-Host ""
+  Write-Host "Motivos/Observaciones:" -ForegroundColor Yellow
+  $reasons | ForEach-Object { Write-Host " - $_" }
+}
+
+Write-Host ""
+Write-Host "Guías: 64-bit, ≥2 núcleos, RAM≥8GB, SSE4.1/4.2, UEFI + Secure Boot (capaz), TPM 1.2/2.0, SSD recomendado."
+Write-Host "NOTA: Con -StrictSecurity se exige Secure Boot habilitado."
