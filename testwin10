@@ -10,6 +10,7 @@
 
 .NOTES
   Ejecutar en PowerShell x64 (no x86) y preferiblemente elevado.
+  Lo de "heurístico" significa que solo se evalua si es un Core i-series, Xeon, Ryzen. Puede dar falsos negativos con Intel Nehalem/Westmere
 #>
 
 param([switch]$StrictSecurity)
